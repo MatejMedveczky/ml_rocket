@@ -1,10 +1,11 @@
-# from turtle import position
 import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 from mpl_toolkits.mplot3d import Axes3D
 
+EPOCHS = 50
+ORIENTATION = [0.0, np.deg2rad(30), 0.0]
 
 # === Rocket State ===
 class RocketState:
@@ -23,7 +24,7 @@ class RocketSimulator:
         self.drag_coefficient = 0.3
         self.reference_area = 0.01  # m^2
         self.air_density = 1.225  # kg/m^3
-        self.winglet_effectiveness = 1
+        self.winglet_effectiveness = 0.1
         self.dt = 0.01
         self.gravity = np.array([0, 0, -9.81])
         self.thrust_curve = self._generate_thrust_curve()
@@ -40,7 +41,7 @@ class RocketSimulator:
         return RocketState(
             position=np.zeros(3),
             velocity=np.zeros(3),
-            orientation=np.array([0.0, np.deg2rad(30), 0.0]), # orientation=np.zeros(3),
+            orientation=np.array(ORIENTATION), # orientation=np.zeros(3),
             angular_velocity=np.zeros(3),
             winglet_positions=np.zeros(4)
         )
@@ -159,7 +160,7 @@ class RocketController:
 
         # Train model
         return self.model.fit(X_train, y_train, validation_data=(X_val, y_val),
-                            epochs=3, batch_size=32, verbose=1)
+                            epochs=EPOCHS, batch_size=32, verbose=1)
 
 # === Main ===
 def main():
