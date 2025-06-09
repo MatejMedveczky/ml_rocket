@@ -3,8 +3,12 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 from mpl_toolkits.mplot3d import Axes3D
+from datetime import date
+import os
 
-EPOCHS = 50
+RESULTS_DIR = 'results'
+
+EPOCHS = 100
 ORIENTATION = [0.0, np.deg2rad(30), 0.0]
 
 # === Rocket State ===
@@ -243,6 +247,11 @@ def main():
     ax.set_box_aspect([1, 1, 1])
     ax.set_title('3D Rocket Trajectory')
     ax.legend()
+    # Create results directory if it doesn't exist
+    
+    # Save the 3D trajectory plot
+    plt.savefig(os.path.join(RESULTS_DIR, f'3d_trajectory_{date.today().strftime("%Y%m%d")}.png'), dpi=300)
+    plt.show()
 
     winglet_positions_log = np.array(winglet_positions_log)
     time_log = np.array(time_log)
