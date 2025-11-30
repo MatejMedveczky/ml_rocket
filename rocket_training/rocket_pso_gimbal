@@ -1,12 +1,6 @@
 """
-Scientific Rocket Neural Network Training Framework (PSO + Gimbal Control)
-===========================================================================
 A framework for training neural networks to control gimbal-stabilized rockets
 using Particle Swarm Optimization.
-
-Converted from GA/Winglet implementation to PSO/Gimbal.
-
-Dependencies: numpy, matplotlib
 """
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,29 +14,28 @@ import time
 from sqlalchemy import FunctionElement
 from sympy import fu
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-
 @dataclass
 class RocketConfig:
     """Rocket physical parameters for gimbal-controlled vehicle"""
-    mass: float = 0.192              # kg
-    motor_mass: float = 0.0307
+    mass: float = 0.192             # kg
+    motor_mass: float = 0.0307      # kg
     fuel_mass: float = 0.0148
-    drag_coefficient: float = 0.001   
-    max_gimbal_angle: float = 0.7   # radians (~8.6 degrees) - typical TVC limit
-    gimbal_rate_limit: float = 1.0   # rad/s - actuator slew rate
-    moment_arm: float = 0.09         # meters - distance from gimbal pivot to CoM
-    inertia: float = 0.002           # kg*m^2 - moment of inertia (approx cylinder)
-    
-    # Thrust curve: (time_seconds, force_newtons) - linearly interpolated
+    drag_coefficient: float = 0.3   
+    max_gimbal_angle: float = 0.13  # radians (7.5 degrees)
+    gimbal_rate_limit: float = 0.5  # rad/s
+    moment_arm: float = 0.09        # meters - distance from gimbal pivot to CoM
+    inertia: float = 0.002          # kg*m^2
+    diameter: float = 0.05          # meters
+    winglets_area: float = 0.002*0.03*4   # m^2
+    rho: float = 1.225              # kg/m^3
+
+    # Rectrated thrust curve of the TSP D-12 motor 
     thrust_curve: List[Tuple[float, float]] = field(default_factory=lambda: [
         (0.0,  0.0),
         (0.2, 2.5),
         (0.4,  10),
         (0.5,  28.1),
-        (0.6,  21),
+        (0.6,  17),
         (0.8,  14),
         (1.0,  12),
         (1.55,  12),
@@ -58,14 +51,12 @@ class TrainingConfig:
     swarm_size: int = 30
     generations: int = 50
     
-    # PSO coefficients (standard values from literature)
     w_start: float = 0.9             # Initial inertia weight (exploration)
     w_end: float = 0.4               # Final inertia weight (exploitation)
     c1: float = 2.0                  # Cognitive coefficient (personal best attraction)
     c2: float = 2.0                  # Social coefficient (global best attraction)
     v_max_ratio: float = 0.15        # Max velocity as fraction of parameter range
     
-    # Simulation parameters
     max_episode_steps: int = 3000
     dt: float = 0.01
     save_network: bool = True
@@ -83,19 +74,14 @@ class NeuralNetConfig:
             self.hidden_layers = [8, 5]
 
 
-# ==============================================================================
-# DATA LOGGER
-# ==============================================================================
-
 class DataLogger:
-    """Comprehensive data logging for analysis"""
+    """Data logging for analysis"""
     
     def __init__(self):
         self.generation_data = []
         self.episode_data = []
         self.current_episode = []
         
-        # Real-time metrics
         self.fitness_history = []
         self.best_fitness_history = []
         self.mean_fitness_history = []
@@ -153,11 +139,6 @@ class DataLogger:
             json.dump(export_data, f, indent=2, 
                      default=lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
 
-
-# ==============================================================================
-# ROCKET CLASS (Gimbal-controlled version)
-# ==============================================================================
-
 class Rocket:
     """Rocket with gimbal thrust vector control physics simulation"""
     
@@ -166,40 +147,33 @@ class Rocket:
             config = RocketConfig()
         self.config = config
         
-        # Build thrust curve lookup
         curve = sorted(config.thrust_curve, key=lambda x: x[0])
         self._thrust_times = np.array([p[0] for p in curve])
         self._thrust_values = np.array([p[1] for p in curve])
         
-        # State vectors
         self.position = np.zeros(3)
         self.velocity = np.zeros(3)
         self.orientation = np.array([0.0, 0.0, 0.0])  # roll, pitch, yaw - small initial tilt
         self.angular_velocity = np.zeros(3)
         
-        # Gimbal controls: [pitch_deflection, yaw_deflection] in radians
         self.gimbal = np.zeros(2)
         self.thrust = 0.0
         
-        # Sensors
         self.gyro = np.zeros(3)
         self.accel = np.zeros(3)
         
-        # Telemetry
         self.flight_time = 0.0
         self.max_altitude = 0.0
         self.total_distance = 0.0
         
     def reset(self):
-        """Reset rocket state with small perturbations for robustness"""
         self.position = np.array([0.0, 0.0, 0.1])
         self.position += np.random.randn(3) * 0.05
-        self.position[2] = max(0.1, self.position[2])  # Keep above ground
+        self.position[2] = max(0.1, self.position[2])
         
         self.velocity = np.zeros(3)
         self.velocity += np.random.randn(3) * 0.1
         
-        # Random initial orientation perturbation (simulates launch rail imperfection)
         self.orientation = np.random.randn(3) * 0.05
         self.angular_velocity = np.zeros(3)
         
@@ -215,7 +189,7 @@ class Rocket:
         self.total_distance = 0.0
         
     def get_rotation_matrix(self) -> np.ndarray:
-        """Compute combined rotation matrix (ZYX Euler convention)"""
+        """Compute combined rotation matrix"""
         roll, pitch, yaw = self.orientation
         
         Rx = np.array([[1, 0, 0],
@@ -248,61 +222,49 @@ class Rocket:
     
     def update(self, dt: float):
         """Update rocket physics with gimbal TVC"""
-        # === FORCES ===
         forces = np.array([0.0, 0.0, -9.81 * self.config.mass])  # Gravity
         
-        # Thrust with gimbal deflection
         thrust_magnitude = self.compute_thrust(self.flight_time)
         
         if thrust_magnitude > 0:
-            # Gimbal angles create thrust vector offset
-            # gimbal[0] = pitch deflection, gimbal[1] = yaw deflection
             pitch_gimbal, yaw_gimbal = self.gimbal
             
-            # Thrust vector in body frame (deflected by gimbal)
             thrust_body = np.array([
-                thrust_magnitude * np.sin(yaw_gimbal),    # X component (yaw deflection)
-                thrust_magnitude * np.sin(pitch_gimbal),  # Y component (pitch deflection)
-                thrust_magnitude * np.cos(pitch_gimbal) * np.cos(yaw_gimbal)  # Z component (main)
+                thrust_magnitude * np.sin(yaw_gimbal),   
+                thrust_magnitude * np.sin(pitch_gimbal),
+                thrust_magnitude * np.cos(pitch_gimbal) * np.cos(yaw_gimbal)
             ])
             
-            # Transform to world frame
             R = self.get_rotation_matrix()
             thrust_world = R @ thrust_body
             forces += thrust_world
             
-            # === TORQUES from gimbal (thrust vector control) ===
-            # Torque = moment_arm × thrust_deflection_component
             torques = np.array([
-                -thrust_magnitude * np.sin(pitch_gimbal) * self.config.moment_arm,  # Roll torque
-                thrust_magnitude * np.sin(yaw_gimbal) * self.config.moment_arm,     # Pitch torque  
-                0.0  # Yaw torque (would need differential thrust or fins)
+                -thrust_magnitude * np.sin(pitch_gimbal) * self.config.moment_arm,
+                thrust_magnitude * np.sin(yaw_gimbal) * self.config.moment_arm,
+                0.0
             ])
         else:
             torques = np.zeros(3)
+
+        # torques = np.zeros(3)
         
-        # Drag (proportional to v^2)
         speed = np.linalg.norm(self.velocity)
         if speed > 0.01:
-            drag = -self.config.drag_coefficient * self.velocity * speed
+            drag = 1/2 * self.config.rho * speed**2 * self.config.drag_coefficient * ((np.pi * (self.config.diameter / 2)**2) + self.config.winglets_area)
             forces += drag
         
         # === ANGULAR DYNAMICS ===
-        # Passive aerodynamic damping (simplified)
         aero_damping = -0.01 * self.angular_velocity * speed
         torques += aero_damping
         
-        # Angular acceleration (simplified - assuming diagonal inertia tensor)
         angular_accel = torques / self.config.inertia
         
-        # Update angular velocity with damping
         self.angular_velocity += angular_accel * dt
-        self.angular_velocity *= 0.995  # Small numerical damping
+        self.angular_velocity *= 0.995 
         
-        # Update orientation
         self.orientation += self.angular_velocity * dt
         
-        # Clamp pitch to prevent gimbal lock issues
         self.orientation[1] = np.clip(self.orientation[1], -np.pi/2 + 0.1, np.pi/2 - 0.1)
         
         # === LINEAR DYNAMICS ===
@@ -310,20 +272,16 @@ class Rocket:
         self.velocity += acceleration * dt
         self.position += self.velocity * dt
         
-        # Ground collision
         if self.position[2] < 0:
             self.position[2] = 0
             self.velocity[2] = max(0, self.velocity[2])
-            # Friction-like damping on ground
             self.velocity[:2] *= 0.9
         
-        # Update sensors
         self.update_sensors(acceleration)
 
         if 1.69 < self.flight_time < 1.71:
             print(f"BURNOUT: alt={self.position[2]:.1f}m, vel_z={self.velocity[2]:.1f}m/s")
         
-        # Update telemetry
         self.flight_time += dt
         self.max_altitude = max(self.max_altitude, self.position[2])
         self.total_distance += speed * dt
@@ -332,10 +290,8 @@ class Rocket:
     
     def update_sensors(self, acceleration: np.ndarray):
         """Update IMU sensors with realistic noise"""
-        # Gyroscope (angular velocity + noise)
         self.gyro = self.angular_velocity + np.random.randn(3) * 0.01
         
-        # Accelerometer (body frame acceleration + noise)
         R = self.get_rotation_matrix()
         body_accel = R.T @ acceleration
         self.accel = body_accel + np.random.randn(3) * 0.1
@@ -346,8 +302,7 @@ class Rocket:
                                 -self.config.max_gimbal_angle, 
                                 self.config.max_gimbal_angle)
         
-        # Rate limiting (gimbal servos have finite slew rate)
-        max_delta = self.config.gimbal_rate_limit * 0.01  # dt = 0.01
+        max_delta = self.config.gimbal_rate_limit * 0.01
         delta = target_gimbal - self.gimbal
         delta = np.clip(delta, -max_delta, max_delta)
         
@@ -365,13 +320,8 @@ class Rocket:
             'speed': np.linalg.norm(self.velocity)
         }
 
-
-# ==============================================================================
-# NEURAL NETWORK
-# ==============================================================================
-
 class NeuralNetwork:
-    """Feedforward neural network with numpy - optimized via PSO"""
+    """Feedforward neural network based controller - optimized via PSO"""
     
     def __init__(self, config: NeuralNetConfig = None):
         if config is None:
@@ -380,12 +330,10 @@ class NeuralNetwork:
         self.config = config
         self.layer_sizes = [config.input_size] + config.hidden_layers + [config.output_size]
         
-        # Initialize weights and biases
         self.weights = []
         self.biases = []
         
         for i in range(len(self.layer_sizes) - 1):
-            # He initialization
             w = np.random.randn(self.layer_sizes[i], self.layer_sizes[i+1]) * np.sqrt(2.0 / self.layer_sizes[i])
             b = np.zeros(self.layer_sizes[i+1])
             self.weights.append(w)
@@ -399,14 +347,12 @@ class NeuralNetwork:
             z = activation @ w + b
             
             if i < len(self.weights) - 1:
-                activation = np.maximum(0, z)  # ReLU for hidden layers
+                activation = np.maximum(0, z) 
             else:
-                activation = np.tanh(z)  # Tanh for bounded output [-1, 1]
-        
+                activation = np.tanh(z)  
         return activation
     
     def get_flat_params(self) -> np.ndarray:
-        """Flatten all parameters to single vector (for PSO)"""
         params = []
         for w, b in zip(self.weights, self.biases):
             params.extend(w.flatten())
@@ -414,7 +360,6 @@ class NeuralNetwork:
         return np.array(params)
     
     def set_flat_params(self, flat_params: np.ndarray):
-        """Set parameters from flattened vector (for PSO)"""
         idx = 0
         for i in range(len(self.weights)):
             w_size = self.weights[i].size
@@ -427,24 +372,16 @@ class NeuralNetwork:
             idx += b_size
     
     def get_param_count(self) -> int:
-        """Get total number of parameters"""
         return sum(w.size + b.size for w, b in zip(self.weights, self.biases))
     
     def copy(self) -> 'NeuralNetwork':
-        """Deep copy"""
         copy_nn = NeuralNetwork(self.config)
         copy_nn.weights = [w.copy() for w in self.weights]
         copy_nn.biases = [b.copy() for b in self.biases]
         return copy_nn
 
-
-# ==============================================================================
-# PARTICLE (PSO)
-# ==============================================================================
-
 class Particle:
     """
-    PSO Particle representing a candidate neural network.
     Position = NN parameters, Velocity = parameter change rate
     """
     
@@ -452,46 +389,34 @@ class Particle:
         self.dim = dim
         self.bounds = bounds
         
-        # Initialize position randomly within bounds
         self.position = np.random.uniform(bounds[0], bounds[1], dim)
         
-        # Initialize velocity (small random values)
         v_range = (bounds[1] - bounds[0]) * 0.1
         self.velocity = np.random.uniform(-v_range, v_range, dim)
         
-        # Personal best
         self.pbest_position = self.position.copy()
         self.pbest_fitness = -np.inf
         
-        # Current fitness
         self.fitness = -np.inf
     
     def update_pbest(self):
-        """Update personal best if current fitness is better"""
         if self.fitness > self.pbest_fitness:
             self.pbest_fitness = self.fitness
             self.pbest_position = self.position.copy()
 
-
-# ==============================================================================
-# ENVIRONMENT
-# ==============================================================================
-
 class Environment:
-    """Rocket training environment for launch scenario"""
+    """Rocket training environment"""
     
     def __init__(self, rocket_config: RocketConfig = None):
         self.rocket = Rocket(rocket_config)
         self.time_step = 0
         self.max_steps = 3000
-        self.dt = 0.01
+        self.dt = 0.01      # seconds
         
         self.previous_gimbal = np.zeros(2)
         
-        # Target: stable vertical ascent
-        self.target_altitude = 30.0  # meters
+        self.target_altitude = 180.0  # meters
         
-        # Metrics
         self.episode_reward = 0.0
         self.trajectory = []
         
@@ -521,32 +446,23 @@ class Environment:
     
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, dict]:
         """Execute one simulation step"""
-        # Action is 2D: [pitch_gimbal, yaw_gimbal] in range [-1, 1]
-        # Scale to actual gimbal range
-        gimbal_commands = action * self.rocket.config.max_gimbal_angle # np.zeros(2) 
+        gimbal_commands = action * self.rocket.config.max_gimbal_angle
         
-        # Apply gimbal commands
         self.rocket.set_gimbal(gimbal_commands)
         
-        # Update physics
         self.rocket.update(self.dt)
         
-        # Store for next observation
         self.previous_gimbal = action.copy()
         
-        # Calculate reward
         reward = self.calculate_reward()
         self.episode_reward += reward
         
-        # Store trajectory
         self.trajectory.append(self.rocket.get_state_dict())
         
-        # Check termination
         done = self.is_done()
         
         self.time_step += 1
         
-        # Info dict for analysis
         info = {
             'altitude': self.rocket.position[2],
             'speed': np.linalg.norm(self.rocket.velocity),
@@ -566,14 +482,13 @@ class Environment:
         """
         reward = 0.0
         
-        # Reward altitude gain
         reward += self.rocket.position[2] * 0.1
         
         # Penalize tilt from vertical
         tilt = np.sqrt(self.rocket.orientation[0]**2 + self.rocket.orientation[1]**2)
         reward -= tilt * 2.0
         
-        # Penalize angular rates (encourage smooth flight)
+        # Penalize angular rates
         angular_rates = np.linalg.norm(self.rocket.angular_velocity)
         reward -= angular_rates * 0.3
         
@@ -595,28 +510,18 @@ class Environment:
         """Check termination conditions"""
         # Max time reached
         if self.time_step >= self.max_steps:
-            # print(f"DONE: max steps at t={self.time_step * self.dt:.2f}s")
+            print(f"DONE: max steps at t={self.time_step * self.dt:.2f}s")
             return True
         
         # Crashed after launch
         if self.rocket.position[2] <= 0 and self.time_step > 100:
-            # print(f"DONE: crashed at t={self.time_step * self.dt:.2f}s")
+            print(f"DONE: crashed at t={self.time_step * self.dt:.2f}s")
             return True
         
         # Drifted too far horizontally
         horizontal_dist = np.linalg.norm(self.rocket.position[:2])
         if horizontal_dist > 50:
-            # print(f"DONE: drifted too far at t={self.time_step * self.dt:.2f}s")
-            return True
-        
-        # Too high (success condition could trigger early stop)
-        # if self.rocket.position[2] > 100:
-
-            return True
-        
-        # Tumbling out of control
-        if np.abs(self.rocket.orientation[:2]).max() > np.pi/2:
-            # print(f"DONE: tumbled at t={self.time_step * self.dt:.2f}s")
+            print(f"DONE: drifted too far at t={self.time_step * self.dt:.2f}s")
             return True
         
         return False
@@ -631,27 +536,18 @@ class Environment:
         # Maximum altitude achieved (primary objective)
         fitness += self.rocket.max_altitude * 15.0
         
-        # Final stability bonus
+        # Stability bonus
         final_tilt = np.sqrt(self.rocket.orientation[0]**2 + self.rocket.orientation[1]**2)
         if final_tilt < 0.2:
             fitness += 50
         elif final_tilt < 0.5:
             fitness += 20
         
-        # Penalize horizontal drift
+        # Horizontal drift penalty
         horizontal_dist = np.linalg.norm(self.rocket.position[:2])
         fitness -= horizontal_dist * 2.0
         
-        # Bonus for reaching target altitude
-        if self.rocket.max_altitude > self.target_altitude:
-            fitness += 100
-        
         return fitness
-
-
-# ==============================================================================
-# PSO TRAINER
-# ==============================================================================
 
 class PSOTrainer:
     """
@@ -662,9 +558,9 @@ class PSOTrainer:
         x_i(t+1) = x_i(t) + v_i(t+1)
     
     Where:
-        w = inertia weight (decreases over time for exploitation)
-        c1 = cognitive coefficient (personal best attraction)
-        c2 = social coefficient (global best attraction)
+        w = inertia weight
+        c1 = cognitive coefficient
+        c2 = social coefficient
         r1, r2 = random values in [0,1]
     """
     
@@ -676,60 +572,52 @@ class PSOTrainer:
         self.rocket_config = rocket_config
         self.logger = DataLogger()
         
-        # Initialize template network to get parameter count
         self.nn_config = NeuralNetConfig()
         template_nn = NeuralNetwork(self.nn_config)
         self.param_dim = template_nn.get_param_count()
         
-        print(f"Neural Network Parameters: {self.param_dim}")
-        print(f"Architecture: {template_nn.layer_sizes}")
+        # print(f"Neural Network Parameters: {self.param_dim}")
+        # print(f"Architecture: {template_nn.layer_sizes}")
         
-        # Parameter bounds for NN weights/biases
         self.param_bounds = (-3.0, 3.0)
         
-        # Initialize swarm
         self.swarm = [Particle(self.param_dim, self.param_bounds) 
                       for _ in range(config.swarm_size)]
         
-        # Global best
         self.gbest_position = None
         self.gbest_fitness = -np.inf
         self.gbest_network = None
         
-        # Velocity bounds (prevents explosion)
         v_range = (self.param_bounds[1] - self.param_bounds[0]) * config.v_max_ratio
         self.v_max = v_range
         self.v_min = -v_range
         
-        # Training state
         self.generation = 0
         
-        # Visualization
         self.setup_visualization()
     
     def setup_visualization(self):
-        """Setup matplotlib figures for real-time plotting"""
         plt.ion()
         
         self.fig = plt.figure(figsize=(12, 8))
-        self.fig.suptitle('Rocket PSO Training (Gimbal Control)', fontsize=14)
+        self.fig.suptitle('Rocket PSO Training', fontsize=14)
         
         gs = GridSpec(2, 3, figure=self.fig, hspace=0.3, wspace=0.3)
         
-        # 3D trajectory plot
         self.ax_3d = self.fig.add_subplot(gs[0:2, 0:2], projection='3d')
         self.ax_3d.set_title('Best Rocket Trajectory')
         self.ax_3d.set_xlabel('X (m)')
         self.ax_3d.set_ylabel('Y (m)')
         self.ax_3d.set_zlabel('Z (m)')
+        self.ax_3d.set_xlim([-20, 20])
+        self.ax_3d.set_ylim([-20, 20])
+        self.ax_3d.set_zlim([0, 300])
         
-        # Fitness history
         self.ax_fitness = self.fig.add_subplot(gs[0, 2])
         self.ax_fitness.set_title('Fitness Evolution')
         self.ax_fitness.set_xlabel('Generation')
         self.ax_fitness.set_ylabel('Fitness')
         
-        # Swarm distribution
         self.ax_dist = self.fig.add_subplot(gs[1, 2])
         self.ax_dist.set_title('Swarm Fitness Distribution')
         self.ax_dist.set_xlabel('Fitness')
@@ -765,7 +653,6 @@ class PSOTrainer:
         return fitness, env
     
     def evaluate_swarm(self, visualize_best: bool = True) -> Tuple[List[float], List[Environment]]:
-        """Evaluate entire swarm"""
         fitnesses = []
         environments = []
         altitudes = []
@@ -779,16 +666,13 @@ class PSOTrainer:
             environments.append(env)
             altitudes.append(env.rocket.max_altitude)
             
-            # Update global best
             if fitness > self.gbest_fitness:
                 self.gbest_fitness = fitness
                 self.gbest_position = particle.position.copy()
                 
-                # Store best network
                 self.gbest_network = NeuralNetwork(self.nn_config)
                 self.gbest_network.set_flat_params(self.gbest_position)
         
-        # Visualize best trajectory
         if visualize_best:
             best_idx = np.argmax(fitnesses)
             self.visualize_trajectory(environments[best_idx])
@@ -806,27 +690,22 @@ class PSOTrainer:
         w = self.get_inertia_weight()
         
         for particle in self.swarm:
-            # Random coefficients
             r1 = np.random.random(self.param_dim)
             r2 = np.random.random(self.param_dim)
             
-            # Velocity update
             cognitive = self.config.c1 * r1 * (particle.pbest_position - particle.position)
             social = self.config.c2 * r2 * (self.gbest_position - particle.position)
             
             particle.velocity = w * particle.velocity + cognitive + social
             
-            # Velocity clamping (prevents explosion)
             particle.velocity = np.clip(particle.velocity, self.v_min, self.v_max)
             
-            # Position update
             particle.position = particle.position + particle.velocity
             
-            # Boundary handling: reflection
             for i in range(self.param_dim):
                 if particle.position[i] < self.param_bounds[0]:
                     particle.position[i] = self.param_bounds[0]
-                    particle.velocity[i] *= -0.5  # Reflect with damping
+                    particle.velocity[i] *= -0.5
                 elif particle.position[i] > self.param_bounds[1]:
                     particle.position[i] = self.param_bounds[1]
                     particle.velocity[i] *= -0.5
@@ -846,7 +725,6 @@ class PSOTrainer:
         self.ax_3d.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], 
                           c='r', s=100, marker='x', label='End')
         
-        # Set consistent limits
         self.ax_3d.set_xlim([-20, 20])
         self.ax_3d.set_ylim([-20, 20])
         self.ax_3d.set_zlim([0, 60])
@@ -858,7 +736,6 @@ class PSOTrainer:
     
     def update_plots(self, fitnesses: List[float]):
         """Update all visualization plots"""
-        # Fitness history
         self.ax_fitness.clear()
         if self.logger.best_fitness_history:
             self.ax_fitness.plot(self.logger.best_fitness_history, 'r-', 
@@ -866,7 +743,6 @@ class PSOTrainer:
             self.ax_fitness.plot(self.logger.mean_fitness_history, 'b-', 
                                label='Swarm Mean', linewidth=1)
             
-            # Diversity band
             mean = np.array(self.logger.mean_fitness_history)
             std = np.array(self.logger.diversity_history)
             self.ax_fitness.fill_between(range(len(mean)), mean - std, mean + std,
@@ -878,7 +754,6 @@ class PSOTrainer:
         self.ax_fitness.set_title('Fitness Evolution')
         self.ax_fitness.grid(True, alpha=0.3)
         
-        # Swarm distribution
         self.ax_dist.clear()
         self.ax_dist.hist(fitnesses, bins=15, edgecolor='black', alpha=0.7, color='steelblue')
         self.ax_dist.axvline(x=np.mean(fitnesses), color='b', linestyle='--', 
@@ -897,7 +772,7 @@ class PSOTrainer:
     def train(self):
         """Main PSO training loop"""
         print(f"\n{'='*60}")
-        print(f"Starting PSO Training")
+        print("Starting PSO Training")
         print(f"Swarm Size: {self.config.swarm_size}")
         print(f"Generations: {self.config.generations}")
         print(f"Parameters: {self.param_dim}")
@@ -909,19 +784,14 @@ class PSOTrainer:
             start_time = time.time()
             self.generation = gen
             
-            # Evaluate swarm
             fitnesses, envs, altitudes = self.evaluate_swarm(visualize_best=(gen % 3 == 0))
             
-            # Log statistics
             self.logger.log_generation(gen, fitnesses)
             
-            # Update visualization
             self.update_plots(fitnesses)
             
-            # Update swarm positions/velocities
             self.update_swarm()
             
-            # Print progress
             elapsed = time.time() - start_time
             w = self.get_inertia_weight()
             print(f"Gen {gen+1:3d}/{self.config.generations} | "
@@ -933,11 +803,10 @@ class PSOTrainer:
                   f"{elapsed:.2f}s")
         
         print(f"\n{'='*60}")
-        print(f"Training Complete!")
+        print("Training Complete!")
         print(f"Best Fitness: {self.gbest_fitness:.2f}")
         print(f"{'='*60}")
         
-        # Export training data
         self.logger.export_data(f"pso_training_data_{int(time.time())}.json")
         
         return self.gbest_network
@@ -978,6 +847,7 @@ class PSOTrainer:
         mean_alt = np.mean([r['max_altitude'] for r in results])
         
         print(f"\nTest Summary: {mean_fitness:.1f} ± {std_fitness:.1f}")
+        print(f"Max overall Altitude: {max(r['max_altitude'] for r in results):.1f}m")
         print(f"Mean Max Altitude: {mean_alt:.1f}m")
         
         return results
@@ -1013,40 +883,27 @@ class PSOTrainer:
         print(f"Network saved to {filename}")
         return filename
 
-
-# ==============================================================================
-# MAIN EXECUTION
-# ==============================================================================
-
 def main():
     """Main entry point"""
-    # Set random seed for reproducibility
     np.random.seed(42)
     
-    # Configure rocket with thrust curve
     rocket_config = RocketConfig()
     
-    # Configure training
     training_config = TrainingConfig(
         swarm_size=30,
         generations=50,
         save_network=True
     )
     
-    # Create PSO trainer
     trainer = PSOTrainer(training_config, rocket_config)
     
-    # Train
     best_network = trainer.train()
     
-    # Test best network
     trainer.test_best_network(episodes=10)
     
-    # Save network
     if training_config.save_network:
         trainer.save_network("best_gimbal_network.json")
     
-    # Keep plots open
     plt.ioff()
     plt.show()
 
