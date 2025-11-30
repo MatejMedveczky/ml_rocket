@@ -33,13 +33,13 @@ from collections import deque
 @dataclass
 class RocketConfig:
     """Rocket physical parameters"""
-    mass: float = 0.3              # kg
+    mass: float = 0.237              # kg
     drag_coefficient: float = 0.3
-    max_gimbal_angle: float = 15.0  # degrees
+    max_gimbal_angle: float = 10.0  # degrees
     max_gimbal_rate: float = 30.0    # degrees per second
     max_thrust: float = 36.0       # Newtons
-    burn_time: float = 2.0         # seconds
-    initial_pitch: float = 10.0    # degrees
+    burn_time: float = 10.0         # seconds
+    initial_pitch: float = 0.0    # degrees
 
 @dataclass
 class TrainingConfig:
@@ -53,7 +53,7 @@ class TrainingConfig:
     max_episode_steps: int = 3000
     dt: float = 0.01
     save_network: bool = True
-    use_lstm: bool = True  # Set to True to use LSTM
+    use_lstm: bool = False  # Set to True to use LSTM
 
 @dataclass
 class NeuralNetConfig:
@@ -682,10 +682,14 @@ class Environment:
             return True
         
         horizontal_dist = np.linalg.norm(self.rocket.position[:2])
-        if horizontal_dist > 50:
-            return True
+        if self.rocket.flight_time < self.rocket.config.burn_time:
+            if horizontal_dist > 50:
+                return True
+        else:
+            if horizontal_dist > 200:  # Much more lenient
+                return True
         
-        if self.rocket.position[2] > 100:
+        if self.rocket.position[2] > 400:
             return True
         
         return False
@@ -695,13 +699,16 @@ class Environment:
         fitness = 0.0
         
         # Primary: survival time
-        fitness += self.time_step * 1.0
+        fitness += 1.001 ** self.time_step
         
         # Penalize average tilt throughout flight
         if len(self.trajectory) > 0:
             avg_tilt = np.mean([np.abs(state['estimated_orientation'][:2]).sum() 
                                for state in self.trajectory])
-            fitness -= avg_tilt * 100.0
+            fitness -= avg_tilt * 2.0
+
+        horizontal_dist = np.linalg.norm(self.rocket.position[:2])
+        fitness -= horizontal_dist
         
         # Bonus for ending upright
         final_tilt = np.abs(self.rocket.estimated_orientation[:2]).sum()
@@ -709,7 +716,7 @@ class Environment:
             fitness += 100.0
         
         # Bonus for max altitude achieved (secondary objective)
-        fitness += self.rocket.max_altitude * 2.0
+        fitness += self.rocket.max_altitude * 50.0
         
         return fitness
 

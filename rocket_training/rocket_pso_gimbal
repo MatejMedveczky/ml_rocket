@@ -1,0 +1,1054 @@
+"""
+Scientific Rocket Neural Network Training Framework (PSO + Gimbal Control)
+===========================================================================
+A framework for training neural networks to control gimbal-stabilized rockets
+using Particle Swarm Optimization.
+
+Converted from GA/Winglet implementation to PSO/Gimbal.
+
+Dependencies: numpy, matplotlib
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from mpl_toolkits.mplot3d import Axes3D
+import json
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
+import time
+
+from sqlalchemy import FunctionElement
+from sympy import fu
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+@dataclass
+class RocketConfig:
+    """Rocket physical parameters for gimbal-controlled vehicle"""
+    mass: float = 0.192              # kg
+    motor_mass: float = 0.0307
+    fuel_mass: float = 0.0148
+    drag_coefficient: float = 0.001   
+    max_gimbal_angle: float = 0.7   # radians (~8.6 degrees) - typical TVC limit
+    gimbal_rate_limit: float = 1.0   # rad/s - actuator slew rate
+    moment_arm: float = 0.09         # meters - distance from gimbal pivot to CoM
+    inertia: float = 0.002           # kg*m^2 - moment of inertia (approx cylinder)
+    
+    # Thrust curve: (time_seconds, force_newtons) - linearly interpolated
+    thrust_curve: List[Tuple[float, float]] = field(default_factory=lambda: [
+        (0.0,  0.0),
+        (0.2, 2.5),
+        (0.4,  10),
+        (0.5,  28.1),
+        (0.6,  21),
+        (0.8,  14),
+        (1.0,  12),
+        (1.55,  12),
+        (1.7,  0),
+    ])
+
+    mass
+
+@dataclass
+class TrainingConfig:
+    """PSO Training hyperparameters"""
+    # Swarm parameters
+    swarm_size: int = 30
+    generations: int = 50
+    
+    # PSO coefficients (standard values from literature)
+    w_start: float = 0.9             # Initial inertia weight (exploration)
+    w_end: float = 0.4               # Final inertia weight (exploitation)
+    c1: float = 2.0                  # Cognitive coefficient (personal best attraction)
+    c2: float = 2.0                  # Social coefficient (global best attraction)
+    v_max_ratio: float = 0.15        # Max velocity as fraction of parameter range
+    
+    # Simulation parameters
+    max_episode_steps: int = 3000
+    dt: float = 0.01
+    save_network: bool = True
+
+
+@dataclass
+class NeuralNetConfig:
+    """Neural network architecture for gimbal control"""
+    input_size: int = 8              # gyro(3) + accel(3) + prev_gimbal(2)
+    hidden_layers: List[int] = None
+    output_size: int = 2             # gimbal_pitch, gimbal_yaw
+    
+    def __post_init__(self):
+        if self.hidden_layers is None:
+            self.hidden_layers = [8, 5]
+
+
+# ==============================================================================
+# DATA LOGGER
+# ==============================================================================
+
+class DataLogger:
+    """Comprehensive data logging for analysis"""
+    
+    def __init__(self):
+        self.generation_data = []
+        self.episode_data = []
+        self.current_episode = []
+        
+        # Real-time metrics
+        self.fitness_history = []
+        self.best_fitness_history = []
+        self.mean_fitness_history = []
+        self.diversity_history = []
+        
+    def log_step(self, rocket_state: dict, controls: dict, reward: float):
+        """Log a single timestep"""
+        self.current_episode.append({
+            'position': rocket_state['position'].copy(),
+            'velocity': rocket_state['velocity'].copy(),
+            'orientation': rocket_state['orientation'].copy(),
+            'controls': controls.copy(),
+            'reward': reward,
+            'timestamp': len(self.current_episode) * 0.01
+        })
+    
+    def end_episode(self, fitness: float, particle_id: int):
+        """Finalize episode logging"""
+        if self.current_episode:
+            self.episode_data.append({
+                'particle_id': particle_id,
+                'fitness': fitness,
+                'trajectory': self.current_episode
+            })
+            self.current_episode = []
+    
+    def log_generation(self, generation: int, population_fitness: List[float]):
+        """Log generation statistics"""
+        stats = {
+            'generation': generation,
+            'best_fitness': max(population_fitness),
+            'mean_fitness': np.mean(population_fitness),
+            'std_fitness': np.std(population_fitness),
+            'min_fitness': min(population_fitness),
+            'median_fitness': np.median(population_fitness)
+        }
+        
+        self.generation_data.append(stats)
+        self.best_fitness_history.append(stats['best_fitness'])
+        self.mean_fitness_history.append(stats['mean_fitness'])
+        self.diversity_history.append(stats['std_fitness'])
+    
+    def export_data(self, filename: str):
+        """Export data to JSON for external analysis"""
+        export_data = {
+            'generations': self.generation_data,
+            'fitness_history': {
+                'best': self.best_fitness_history,
+                'mean': self.mean_fitness_history,
+                'diversity': self.diversity_history
+            }
+        }
+        
+        with open(filename, 'w') as f:
+            json.dump(export_data, f, indent=2, 
+                     default=lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
+
+
+# ==============================================================================
+# ROCKET CLASS (Gimbal-controlled version)
+# ==============================================================================
+
+class Rocket:
+    """Rocket with gimbal thrust vector control physics simulation"""
+    
+    def __init__(self, config: RocketConfig = None):
+        if config is None:
+            config = RocketConfig()
+        self.config = config
+        
+        # Build thrust curve lookup
+        curve = sorted(config.thrust_curve, key=lambda x: x[0])
+        self._thrust_times = np.array([p[0] for p in curve])
+        self._thrust_values = np.array([p[1] for p in curve])
+        
+        # State vectors
+        self.position = np.zeros(3)
+        self.velocity = np.zeros(3)
+        self.orientation = np.array([0.0, 0.0, 0.0])  # roll, pitch, yaw - small initial tilt
+        self.angular_velocity = np.zeros(3)
+        
+        # Gimbal controls: [pitch_deflection, yaw_deflection] in radians
+        self.gimbal = np.zeros(2)
+        self.thrust = 0.0
+        
+        # Sensors
+        self.gyro = np.zeros(3)
+        self.accel = np.zeros(3)
+        
+        # Telemetry
+        self.flight_time = 0.0
+        self.max_altitude = 0.0
+        self.total_distance = 0.0
+        
+    def reset(self):
+        """Reset rocket state with small perturbations for robustness"""
+        self.position = np.array([0.0, 0.0, 0.1])
+        self.position += np.random.randn(3) * 0.05
+        self.position[2] = max(0.1, self.position[2])  # Keep above ground
+        
+        self.velocity = np.zeros(3)
+        self.velocity += np.random.randn(3) * 0.1
+        
+        # Random initial orientation perturbation (simulates launch rail imperfection)
+        self.orientation = np.random.randn(3) * 0.05
+        self.angular_velocity = np.zeros(3)
+        
+        self.gimbal = np.zeros(2)
+        self.thrust = 0.0
+
+        self.position = np.array([0.0, 0.0, 0.1])
+        self.velocity = np.zeros(3)
+        self.orientation = np.zeros(3)
+        
+        self.flight_time = 0.0
+        self.max_altitude = 0.0
+        self.total_distance = 0.0
+        
+    def get_rotation_matrix(self) -> np.ndarray:
+        """Compute combined rotation matrix (ZYX Euler convention)"""
+        roll, pitch, yaw = self.orientation
+        
+        Rx = np.array([[1, 0, 0],
+                      [0, np.cos(roll), -np.sin(roll)],
+                      [0, np.sin(roll), np.cos(roll)]])
+        
+        Ry = np.array([[np.cos(pitch), 0, np.sin(pitch)],
+                      [0, 1, 0],
+                      [-np.sin(pitch), 0, np.cos(pitch)]])
+        
+        Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0],
+                      [np.sin(yaw), np.cos(yaw), 0],
+                      [0, 0, 1]])
+        
+        return Rz @ Ry @ Rx
+    
+    def compute_thrust(self, time: float) -> float:
+        """Compute thrust from curve via linear interpolation"""
+        if time < self._thrust_times[0] or time > self._thrust_times[-1]:
+            return 0.0
+        return np.interp(time, self._thrust_times, self._thrust_values)
+    
+    def compute_mass(self, time: float) -> float:
+        if time < self._thrust_times[0]:
+            return RocketConfig.mass + RocketConfig.motor_mass + RocketConfig.fuel_mass
+        elif time > self._thrust_times[-1]:
+            return RocketConfig.mass + RocketConfig.motor_mass  
+        else:
+            return RocketConfig.mass + RocketConfig.motor_mass + RocketConfig.fuel_mass * (1 - (time / self._thrust_times[-1]))
+    
+    def update(self, dt: float):
+        """Update rocket physics with gimbal TVC"""
+        # === FORCES ===
+        forces = np.array([0.0, 0.0, -9.81 * self.config.mass])  # Gravity
+        
+        # Thrust with gimbal deflection
+        thrust_magnitude = self.compute_thrust(self.flight_time)
+        
+        if thrust_magnitude > 0:
+            # Gimbal angles create thrust vector offset
+            # gimbal[0] = pitch deflection, gimbal[1] = yaw deflection
+            pitch_gimbal, yaw_gimbal = self.gimbal
+            
+            # Thrust vector in body frame (deflected by gimbal)
+            thrust_body = np.array([
+                thrust_magnitude * np.sin(yaw_gimbal),    # X component (yaw deflection)
+                thrust_magnitude * np.sin(pitch_gimbal),  # Y component (pitch deflection)
+                thrust_magnitude * np.cos(pitch_gimbal) * np.cos(yaw_gimbal)  # Z component (main)
+            ])
+            
+            # Transform to world frame
+            R = self.get_rotation_matrix()
+            thrust_world = R @ thrust_body
+            forces += thrust_world
+            
+            # === TORQUES from gimbal (thrust vector control) ===
+            # Torque = moment_arm × thrust_deflection_component
+            torques = np.array([
+                -thrust_magnitude * np.sin(pitch_gimbal) * self.config.moment_arm,  # Roll torque
+                thrust_magnitude * np.sin(yaw_gimbal) * self.config.moment_arm,     # Pitch torque  
+                0.0  # Yaw torque (would need differential thrust or fins)
+            ])
+        else:
+            torques = np.zeros(3)
+        
+        # Drag (proportional to v^2)
+        speed = np.linalg.norm(self.velocity)
+        if speed > 0.01:
+            drag = -self.config.drag_coefficient * self.velocity * speed
+            forces += drag
+        
+        # === ANGULAR DYNAMICS ===
+        # Passive aerodynamic damping (simplified)
+        aero_damping = -0.01 * self.angular_velocity * speed
+        torques += aero_damping
+        
+        # Angular acceleration (simplified - assuming diagonal inertia tensor)
+        angular_accel = torques / self.config.inertia
+        
+        # Update angular velocity with damping
+        self.angular_velocity += angular_accel * dt
+        self.angular_velocity *= 0.995  # Small numerical damping
+        
+        # Update orientation
+        self.orientation += self.angular_velocity * dt
+        
+        # Clamp pitch to prevent gimbal lock issues
+        self.orientation[1] = np.clip(self.orientation[1], -np.pi/2 + 0.1, np.pi/2 - 0.1)
+        
+        # === LINEAR DYNAMICS ===
+        acceleration = forces / self.config.mass
+        self.velocity += acceleration * dt
+        self.position += self.velocity * dt
+        
+        # Ground collision
+        if self.position[2] < 0:
+            self.position[2] = 0
+            self.velocity[2] = max(0, self.velocity[2])
+            # Friction-like damping on ground
+            self.velocity[:2] *= 0.9
+        
+        # Update sensors
+        self.update_sensors(acceleration)
+
+        if 1.69 < self.flight_time < 1.71:
+            print(f"BURNOUT: alt={self.position[2]:.1f}m, vel_z={self.velocity[2]:.1f}m/s")
+        
+        # Update telemetry
+        self.flight_time += dt
+        self.max_altitude = max(self.max_altitude, self.position[2])
+        self.total_distance += speed * dt
+        
+        self.thrust = thrust_magnitude
+    
+    def update_sensors(self, acceleration: np.ndarray):
+        """Update IMU sensors with realistic noise"""
+        # Gyroscope (angular velocity + noise)
+        self.gyro = self.angular_velocity + np.random.randn(3) * 0.01
+        
+        # Accelerometer (body frame acceleration + noise)
+        R = self.get_rotation_matrix()
+        body_accel = R.T @ acceleration
+        self.accel = body_accel + np.random.randn(3) * 0.1
+    
+    def set_gimbal(self, gimbal_commands: np.ndarray):
+        """Apply gimbal commands with rate limiting and saturation"""
+        target_gimbal = np.clip(gimbal_commands, 
+                                -self.config.max_gimbal_angle, 
+                                self.config.max_gimbal_angle)
+        
+        # Rate limiting (gimbal servos have finite slew rate)
+        max_delta = self.config.gimbal_rate_limit * 0.01  # dt = 0.01
+        delta = target_gimbal - self.gimbal
+        delta = np.clip(delta, -max_delta, max_delta)
+        
+        self.gimbal = self.gimbal + delta
+    
+    def get_state_dict(self) -> dict:
+        """Get state as dictionary for logging"""
+        return {
+            'position': self.position.copy(),
+            'velocity': self.velocity.copy(),
+            'orientation': self.orientation.copy(),
+            'angular_velocity': self.angular_velocity.copy(),
+            'gimbal': self.gimbal.copy(),
+            'altitude': self.position[2],
+            'speed': np.linalg.norm(self.velocity)
+        }
+
+
+# ==============================================================================
+# NEURAL NETWORK
+# ==============================================================================
+
+class NeuralNetwork:
+    """Feedforward neural network with numpy - optimized via PSO"""
+    
+    def __init__(self, config: NeuralNetConfig = None):
+        if config is None:
+            config = NeuralNetConfig()
+            
+        self.config = config
+        self.layer_sizes = [config.input_size] + config.hidden_layers + [config.output_size]
+        
+        # Initialize weights and biases
+        self.weights = []
+        self.biases = []
+        
+        for i in range(len(self.layer_sizes) - 1):
+            # He initialization
+            w = np.random.randn(self.layer_sizes[i], self.layer_sizes[i+1]) * np.sqrt(2.0 / self.layer_sizes[i])
+            b = np.zeros(self.layer_sizes[i+1])
+            self.weights.append(w)
+            self.biases.append(b)
+    
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        """Forward pass through network"""
+        activation = x
+        
+        for i, (w, b) in enumerate(zip(self.weights, self.biases)):
+            z = activation @ w + b
+            
+            if i < len(self.weights) - 1:
+                activation = np.maximum(0, z)  # ReLU for hidden layers
+            else:
+                activation = np.tanh(z)  # Tanh for bounded output [-1, 1]
+        
+        return activation
+    
+    def get_flat_params(self) -> np.ndarray:
+        """Flatten all parameters to single vector (for PSO)"""
+        params = []
+        for w, b in zip(self.weights, self.biases):
+            params.extend(w.flatten())
+            params.extend(b.flatten())
+        return np.array(params)
+    
+    def set_flat_params(self, flat_params: np.ndarray):
+        """Set parameters from flattened vector (for PSO)"""
+        idx = 0
+        for i in range(len(self.weights)):
+            w_size = self.weights[i].size
+            b_size = self.biases[i].size
+            
+            self.weights[i] = flat_params[idx:idx + w_size].reshape(self.weights[i].shape)
+            idx += w_size
+            
+            self.biases[i] = flat_params[idx:idx + b_size].reshape(self.biases[i].shape)
+            idx += b_size
+    
+    def get_param_count(self) -> int:
+        """Get total number of parameters"""
+        return sum(w.size + b.size for w, b in zip(self.weights, self.biases))
+    
+    def copy(self) -> 'NeuralNetwork':
+        """Deep copy"""
+        copy_nn = NeuralNetwork(self.config)
+        copy_nn.weights = [w.copy() for w in self.weights]
+        copy_nn.biases = [b.copy() for b in self.biases]
+        return copy_nn
+
+
+# ==============================================================================
+# PARTICLE (PSO)
+# ==============================================================================
+
+class Particle:
+    """
+    PSO Particle representing a candidate neural network.
+    Position = NN parameters, Velocity = parameter change rate
+    """
+    
+    def __init__(self, dim: int, bounds: Tuple[float, float] = (-3.0, 3.0)):
+        self.dim = dim
+        self.bounds = bounds
+        
+        # Initialize position randomly within bounds
+        self.position = np.random.uniform(bounds[0], bounds[1], dim)
+        
+        # Initialize velocity (small random values)
+        v_range = (bounds[1] - bounds[0]) * 0.1
+        self.velocity = np.random.uniform(-v_range, v_range, dim)
+        
+        # Personal best
+        self.pbest_position = self.position.copy()
+        self.pbest_fitness = -np.inf
+        
+        # Current fitness
+        self.fitness = -np.inf
+    
+    def update_pbest(self):
+        """Update personal best if current fitness is better"""
+        if self.fitness > self.pbest_fitness:
+            self.pbest_fitness = self.fitness
+            self.pbest_position = self.position.copy()
+
+
+# ==============================================================================
+# ENVIRONMENT
+# ==============================================================================
+
+class Environment:
+    """Rocket training environment for launch scenario"""
+    
+    def __init__(self, rocket_config: RocketConfig = None):
+        self.rocket = Rocket(rocket_config)
+        self.time_step = 0
+        self.max_steps = 3000
+        self.dt = 0.01
+        
+        self.previous_gimbal = np.zeros(2)
+        
+        # Target: stable vertical ascent
+        self.target_altitude = 30.0  # meters
+        
+        # Metrics
+        self.episode_reward = 0.0
+        self.trajectory = []
+        
+    def reset(self) -> np.ndarray:
+        """Reset environment for new episode"""
+        self.rocket.reset()
+        self.time_step = 0
+        self.previous_gimbal = np.zeros(2)
+        self.episode_reward = 0.0
+        self.trajectory = []
+        
+        return self.get_observation()
+    
+    def get_observation(self) -> np.ndarray:
+        """
+        Get sensor observation vector:
+        - Gyroscope readings (3)
+        - Accelerometer readings (3)
+        - Previous gimbal commands (2)
+        Total: 8 inputs
+        """
+        return np.concatenate([
+            self.rocket.gyro,
+            self.rocket.accel,
+            self.previous_gimbal
+        ])
+    
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, dict]:
+        """Execute one simulation step"""
+        # Action is 2D: [pitch_gimbal, yaw_gimbal] in range [-1, 1]
+        # Scale to actual gimbal range
+        gimbal_commands = action * self.rocket.config.max_gimbal_angle # np.zeros(2) 
+        
+        # Apply gimbal commands
+        self.rocket.set_gimbal(gimbal_commands)
+        
+        # Update physics
+        self.rocket.update(self.dt)
+        
+        # Store for next observation
+        self.previous_gimbal = action.copy()
+        
+        # Calculate reward
+        reward = self.calculate_reward()
+        self.episode_reward += reward
+        
+        # Store trajectory
+        self.trajectory.append(self.rocket.get_state_dict())
+        
+        # Check termination
+        done = self.is_done()
+        
+        self.time_step += 1
+        
+        # Info dict for analysis
+        info = {
+            'altitude': self.rocket.position[2],
+            'speed': np.linalg.norm(self.rocket.velocity),
+            'tilt': np.abs(self.rocket.orientation[:2]).sum(),
+            'time': self.time_step * self.dt,
+            'gimbal': self.rocket.gimbal.copy()
+        }
+        
+        return self.get_observation(), reward, done, info
+    
+    def calculate_reward(self) -> float:
+        """
+        Calculate step reward encouraging:
+        1. Altitude gain
+        2. Vertical stability (minimal tilt)
+        3. Smooth control (low angular rates)
+        """
+        reward = 0.0
+        
+        # Reward altitude gain
+        reward += self.rocket.position[2] * 0.1
+        
+        # Penalize tilt from vertical
+        tilt = np.sqrt(self.rocket.orientation[0]**2 + self.rocket.orientation[1]**2)
+        reward -= tilt * 2.0
+        
+        # Penalize angular rates (encourage smooth flight)
+        angular_rates = np.linalg.norm(self.rocket.angular_velocity)
+        reward -= angular_rates * 0.3
+        
+        # Bonus for being near vertical with good altitude
+        if tilt < 0.1 and self.rocket.position[2] > 5.0:
+            reward += 2.0
+        
+        # Strong penalty for ground contact after launch
+        if self.rocket.position[2] <= 0.05 and self.time_step > 50:
+            reward -= 50.0
+        
+        # Penalize excessive horizontal drift
+        horizontal_dist = np.linalg.norm(self.rocket.position[:2])
+        reward -= horizontal_dist * 0.1
+        
+        return reward
+    
+    def is_done(self) -> bool:
+        """Check termination conditions"""
+        # Max time reached
+        if self.time_step >= self.max_steps:
+            # print(f"DONE: max steps at t={self.time_step * self.dt:.2f}s")
+            return True
+        
+        # Crashed after launch
+        if self.rocket.position[2] <= 0 and self.time_step > 100:
+            # print(f"DONE: crashed at t={self.time_step * self.dt:.2f}s")
+            return True
+        
+        # Drifted too far horizontally
+        horizontal_dist = np.linalg.norm(self.rocket.position[:2])
+        if horizontal_dist > 50:
+            # print(f"DONE: drifted too far at t={self.time_step * self.dt:.2f}s")
+            return True
+        
+        # Too high (success condition could trigger early stop)
+        # if self.rocket.position[2] > 100:
+
+            return True
+        
+        # Tumbling out of control
+        if np.abs(self.rocket.orientation[:2]).max() > np.pi/2:
+            # print(f"DONE: tumbled at t={self.time_step * self.dt:.2f}s")
+            return True
+        
+        return False
+    
+    def get_fitness(self) -> float:
+        """Calculate final fitness score"""
+        fitness = 0.0
+        
+        # Survival time bonus
+        fitness += self.time_step * 0.05
+        
+        # Maximum altitude achieved (primary objective)
+        fitness += self.rocket.max_altitude * 15.0
+        
+        # Final stability bonus
+        final_tilt = np.sqrt(self.rocket.orientation[0]**2 + self.rocket.orientation[1]**2)
+        if final_tilt < 0.2:
+            fitness += 50
+        elif final_tilt < 0.5:
+            fitness += 20
+        
+        # Penalize horizontal drift
+        horizontal_dist = np.linalg.norm(self.rocket.position[:2])
+        fitness -= horizontal_dist * 2.0
+        
+        # Bonus for reaching target altitude
+        if self.rocket.max_altitude > self.target_altitude:
+            fitness += 100
+        
+        return fitness
+
+
+# ==============================================================================
+# PSO TRAINER
+# ==============================================================================
+
+class PSOTrainer:
+    """
+    Particle Swarm Optimization trainer for neural network rocket control.
+    
+    PSO Update Equations:
+        v_i(t+1) = w*v_i(t) + c1*r1*(pbest_i - x_i) + c2*r2*(gbest - x_i)
+        x_i(t+1) = x_i(t) + v_i(t+1)
+    
+    Where:
+        w = inertia weight (decreases over time for exploitation)
+        c1 = cognitive coefficient (personal best attraction)
+        c2 = social coefficient (global best attraction)
+        r1, r2 = random values in [0,1]
+    """
+    
+    def __init__(self, config: TrainingConfig = None, rocket_config: RocketConfig = None):
+        if config is None:
+            config = TrainingConfig()
+        
+        self.config = config
+        self.rocket_config = rocket_config
+        self.logger = DataLogger()
+        
+        # Initialize template network to get parameter count
+        self.nn_config = NeuralNetConfig()
+        template_nn = NeuralNetwork(self.nn_config)
+        self.param_dim = template_nn.get_param_count()
+        
+        print(f"Neural Network Parameters: {self.param_dim}")
+        print(f"Architecture: {template_nn.layer_sizes}")
+        
+        # Parameter bounds for NN weights/biases
+        self.param_bounds = (-3.0, 3.0)
+        
+        # Initialize swarm
+        self.swarm = [Particle(self.param_dim, self.param_bounds) 
+                      for _ in range(config.swarm_size)]
+        
+        # Global best
+        self.gbest_position = None
+        self.gbest_fitness = -np.inf
+        self.gbest_network = None
+        
+        # Velocity bounds (prevents explosion)
+        v_range = (self.param_bounds[1] - self.param_bounds[0]) * config.v_max_ratio
+        self.v_max = v_range
+        self.v_min = -v_range
+        
+        # Training state
+        self.generation = 0
+        
+        # Visualization
+        self.setup_visualization()
+    
+    def setup_visualization(self):
+        """Setup matplotlib figures for real-time plotting"""
+        plt.ion()
+        
+        self.fig = plt.figure(figsize=(12, 8))
+        self.fig.suptitle('Rocket PSO Training (Gimbal Control)', fontsize=14)
+        
+        gs = GridSpec(2, 3, figure=self.fig, hspace=0.3, wspace=0.3)
+        
+        # 3D trajectory plot
+        self.ax_3d = self.fig.add_subplot(gs[0:2, 0:2], projection='3d')
+        self.ax_3d.set_title('Best Rocket Trajectory')
+        self.ax_3d.set_xlabel('X (m)')
+        self.ax_3d.set_ylabel('Y (m)')
+        self.ax_3d.set_zlabel('Z (m)')
+        
+        # Fitness history
+        self.ax_fitness = self.fig.add_subplot(gs[0, 2])
+        self.ax_fitness.set_title('Fitness Evolution')
+        self.ax_fitness.set_xlabel('Generation')
+        self.ax_fitness.set_ylabel('Fitness')
+        
+        # Swarm distribution
+        self.ax_dist = self.fig.add_subplot(gs[1, 2])
+        self.ax_dist.set_title('Swarm Fitness Distribution')
+        self.ax_dist.set_xlabel('Fitness')
+        self.ax_dist.set_ylabel('Count')
+        
+        plt.show()
+    
+    def get_inertia_weight(self) -> float:
+        """
+        Linearly decreasing inertia weight.
+        High w (0.9) = exploration, Low w (0.4) = exploitation
+        """
+        progress = self.generation / max(1, self.config.generations - 1)
+        w = self.config.w_start - (self.config.w_start - self.config.w_end) * progress
+        return w
+    
+    def evaluate_particle(self, particle: Particle) -> Tuple[float, Environment]:
+        """Evaluate a single particle (run simulation with its NN parameters)"""
+        # Create network from particle position
+        network = NeuralNetwork(self.nn_config)
+        network.set_flat_params(particle.position)
+        
+        # Run simulation
+        env = Environment(self.rocket_config)
+        obs = env.reset()
+        done = False
+        
+        while not done:
+            action = network.forward(obs)
+            obs, reward, done, info = env.step(action)
+        
+        fitness = env.get_fitness()
+        return fitness, env
+    
+    def evaluate_swarm(self, visualize_best: bool = True) -> Tuple[List[float], List[Environment]]:
+        """Evaluate entire swarm"""
+        fitnesses = []
+        environments = []
+        altitudes = []
+        
+        for particle in self.swarm:
+            fitness, env = self.evaluate_particle(particle)
+            particle.fitness = fitness
+            particle.update_pbest()
+            
+            fitnesses.append(fitness)
+            environments.append(env)
+            altitudes.append(env.rocket.max_altitude)
+            
+            # Update global best
+            if fitness > self.gbest_fitness:
+                self.gbest_fitness = fitness
+                self.gbest_position = particle.position.copy()
+                
+                # Store best network
+                self.gbest_network = NeuralNetwork(self.nn_config)
+                self.gbest_network.set_flat_params(self.gbest_position)
+        
+        # Visualize best trajectory
+        if visualize_best:
+            best_idx = np.argmax(fitnesses)
+            self.visualize_trajectory(environments[best_idx])
+        
+        return fitnesses, environments, altitudes
+    
+    def update_swarm(self):
+        """
+        PSO velocity and position update for all particles.
+        
+        Core PSO equations:
+            v = w*v + c1*r1*(pbest - x) + c2*r2*(gbest - x)
+            x = x + v
+        """
+        w = self.get_inertia_weight()
+        
+        for particle in self.swarm:
+            # Random coefficients
+            r1 = np.random.random(self.param_dim)
+            r2 = np.random.random(self.param_dim)
+            
+            # Velocity update
+            cognitive = self.config.c1 * r1 * (particle.pbest_position - particle.position)
+            social = self.config.c2 * r2 * (self.gbest_position - particle.position)
+            
+            particle.velocity = w * particle.velocity + cognitive + social
+            
+            # Velocity clamping (prevents explosion)
+            particle.velocity = np.clip(particle.velocity, self.v_min, self.v_max)
+            
+            # Position update
+            particle.position = particle.position + particle.velocity
+            
+            # Boundary handling: reflection
+            for i in range(self.param_dim):
+                if particle.position[i] < self.param_bounds[0]:
+                    particle.position[i] = self.param_bounds[0]
+                    particle.velocity[i] *= -0.5  # Reflect with damping
+                elif particle.position[i] > self.param_bounds[1]:
+                    particle.position[i] = self.param_bounds[1]
+                    particle.velocity[i] *= -0.5
+    
+    def visualize_trajectory(self, env: Environment):
+        """Update 3D trajectory visualization"""
+        if not env.trajectory:
+            return
+        
+        positions = np.array([state['position'] for state in env.trajectory])
+        
+        self.ax_3d.clear()
+        self.ax_3d.plot(positions[:, 0], positions[:, 1], positions[:, 2], 
+                       'b-', alpha=0.7, linewidth=1.5)
+        self.ax_3d.scatter(positions[0, 0], positions[0, 1], positions[0, 2], 
+                          c='g', s=100, marker='o', label='Launch')
+        self.ax_3d.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], 
+                          c='r', s=100, marker='x', label='End')
+        
+        # Set consistent limits
+        self.ax_3d.set_xlim([-20, 20])
+        self.ax_3d.set_ylim([-20, 20])
+        self.ax_3d.set_zlim([0, 60])
+        self.ax_3d.set_xlabel('X (m)')
+        self.ax_3d.set_ylabel('Y (m)')
+        self.ax_3d.set_zlabel('Altitude (m)')
+        self.ax_3d.legend()
+        self.ax_3d.set_title(f'Best Trajectory (Gen {self.generation})')
+    
+    def update_plots(self, fitnesses: List[float]):
+        """Update all visualization plots"""
+        # Fitness history
+        self.ax_fitness.clear()
+        if self.logger.best_fitness_history:
+            self.ax_fitness.plot(self.logger.best_fitness_history, 'r-', 
+                               label='Global Best', linewidth=2)
+            self.ax_fitness.plot(self.logger.mean_fitness_history, 'b-', 
+                               label='Swarm Mean', linewidth=1)
+            
+            # Diversity band
+            mean = np.array(self.logger.mean_fitness_history)
+            std = np.array(self.logger.diversity_history)
+            self.ax_fitness.fill_between(range(len(mean)), mean - std, mean + std,
+                                        alpha=0.3, color='blue')
+        
+        self.ax_fitness.legend(loc='lower right')
+        self.ax_fitness.set_xlabel('Generation')
+        self.ax_fitness.set_ylabel('Fitness')
+        self.ax_fitness.set_title('Fitness Evolution')
+        self.ax_fitness.grid(True, alpha=0.3)
+        
+        # Swarm distribution
+        self.ax_dist.clear()
+        self.ax_dist.hist(fitnesses, bins=15, edgecolor='black', alpha=0.7, color='steelblue')
+        self.ax_dist.axvline(x=np.mean(fitnesses), color='b', linestyle='--', 
+                            label=f'Mean: {np.mean(fitnesses):.1f}')
+        self.ax_dist.axvline(x=max(fitnesses), color='r', linestyle='--', 
+                            label=f'Best: {max(fitnesses):.1f}')
+        self.ax_dist.axvline(x=self.gbest_fitness, color='g', linestyle='-', 
+                            label=f'Global: {self.gbest_fitness:.1f}')
+        self.ax_dist.legend(fontsize=8)
+        self.ax_dist.set_xlabel('Fitness')
+        self.ax_dist.set_ylabel('Count')
+        self.ax_dist.set_title('Swarm Distribution')
+        
+        plt.pause(0.001)
+    
+    def train(self):
+        """Main PSO training loop"""
+        print(f"\n{'='*60}")
+        print(f"Starting PSO Training")
+        print(f"Swarm Size: {self.config.swarm_size}")
+        print(f"Generations: {self.config.generations}")
+        print(f"Parameters: {self.param_dim}")
+        print(f"PSO: w={self.config.w_start}→{self.config.w_end}, "
+              f"c1={self.config.c1}, c2={self.config.c2}")
+        print(f"{'='*60}\n")
+        
+        for gen in range(self.config.generations):
+            start_time = time.time()
+            self.generation = gen
+            
+            # Evaluate swarm
+            fitnesses, envs, altitudes = self.evaluate_swarm(visualize_best=(gen % 3 == 0))
+            
+            # Log statistics
+            self.logger.log_generation(gen, fitnesses)
+            
+            # Update visualization
+            self.update_plots(fitnesses)
+            
+            # Update swarm positions/velocities
+            self.update_swarm()
+            
+            # Print progress
+            elapsed = time.time() - start_time
+            w = self.get_inertia_weight()
+            print(f"Gen {gen+1:3d}/{self.config.generations} | "
+                  f"Best: {max(fitnesses):7.1f} | "
+                  f"Mean: {np.mean(fitnesses):7.1f} | "
+                  f"Global: {self.gbest_fitness:7.1f} | "
+                  f"MaxAlt: {max(altitudes):5.1f}m | "
+                  f"w={w:.2f} | "
+                  f"{elapsed:.2f}s")
+        
+        print(f"\n{'='*60}")
+        print(f"Training Complete!")
+        print(f"Best Fitness: {self.gbest_fitness:.2f}")
+        print(f"{'='*60}")
+        
+        # Export training data
+        self.logger.export_data(f"pso_training_data_{int(time.time())}.json")
+        
+        return self.gbest_network
+    
+    def test_best_network(self, episodes: int = 5):
+        """Test the best network multiple times"""
+        if self.gbest_network is None:
+            print("No best network found. Train first!")
+            return
+        
+        print(f"\nTesting best network on {episodes} episodes...")
+        
+        results = []
+        for episode in range(episodes):
+            env = Environment(self.rocket_config)
+            obs = env.reset()
+            done = False
+            
+            while not done:
+                action = self.gbest_network.forward(obs)
+                obs, reward, done, info = env.step(action)
+            
+            fitness = env.get_fitness()
+            results.append({
+                'fitness': fitness,
+                'max_altitude': env.rocket.max_altitude,
+                'flight_time': env.time_step * env.dt,
+                'final_tilt': np.linalg.norm(env.rocket.orientation[:2])
+            })
+            
+            print(f"  Episode {episode+1}: Fitness={fitness:7.1f}, "
+                  f"MaxAlt={env.rocket.max_altitude:5.1f}m, "
+                  f"Time={env.time_step * env.dt:.1f}s, "
+                  f"Tilt={np.rad2deg(results[-1]['final_tilt']):.1f}°")
+        
+        mean_fitness = np.mean([r['fitness'] for r in results])
+        std_fitness = np.std([r['fitness'] for r in results])
+        mean_alt = np.mean([r['max_altitude'] for r in results])
+        
+        print(f"\nTest Summary: {mean_fitness:.1f} ± {std_fitness:.1f}")
+        print(f"Mean Max Altitude: {mean_alt:.1f}m")
+        
+        return results
+    
+    def save_network(self, filename: str = None):
+        """Save the best network weights for deployment (e.g., ESP32)"""
+        if self.gbest_network is None:
+            print("No network to save!")
+            return
+        
+        if filename is None:
+            filename = f"best_network_gimbal_{int(time.time())}.json"
+        
+        network_data = {
+            "architecture": {
+                "input_size": self.nn_config.input_size,
+                "hidden_layers": self.nn_config.hidden_layers,
+                "output_size": self.nn_config.output_size
+            },
+            "weights": [w.tolist() for w in self.gbest_network.weights],
+            "biases": [b.tolist() for b in self.gbest_network.biases],
+            "training_info": {
+                "algorithm": "PSO",
+                "generations": self.config.generations,
+                "swarm_size": self.config.swarm_size,
+                "final_fitness": self.gbest_fitness
+            }
+        }
+        
+        with open(filename, "w") as f:
+            json.dump(network_data, f, indent=2)
+        
+        print(f"Network saved to {filename}")
+        return filename
+
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+
+def main():
+    """Main entry point"""
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
+    # Configure rocket with thrust curve
+    rocket_config = RocketConfig()
+    
+    # Configure training
+    training_config = TrainingConfig(
+        swarm_size=30,
+        generations=50,
+        save_network=True
+    )
+    
+    # Create PSO trainer
+    trainer = PSOTrainer(training_config, rocket_config)
+    
+    # Train
+    best_network = trainer.train()
+    
+    # Test best network
+    trainer.test_best_network(episodes=10)
+    
+    # Save network
+    if training_config.save_network:
+        trainer.save_network("best_gimbal_network.json")
+    
+    # Keep plots open
+    plt.ioff()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
