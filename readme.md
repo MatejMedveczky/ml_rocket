@@ -55,9 +55,9 @@ The natural next step is hardware validation on actual flight tests. The CAD mod
   <img src="rocket_body_v35.png" alt="Gimbal-Stabilized Rocket CAD Model" width="500"/>
 </p>
 
-Beyond flight testing, a basic flight computer implementation for ESP32-C3 is currently under development, featuring state machine logic for launch detection, flight phase transitions, and hardware interfaces for IMU sensors, gimbal servo control, and pyrotechnic deployment channels. The modular architecture separates sensor fusion, control logic, and actuator management to facilitate integration of the trained neural network controller.
+A basic flight computer implementation for ESP32-C3 is currently under development, featuring state machine logic for launch detection, flight phase transitions, and hardware interfaces for IMU sensors, gimbal servo control, and pyrotechnic deployment channels. The modular architecture separates sensor fusion, control logic, and actuator management to facilitate integration of the trained neural network controller.
 
-Apart from that, in the theoretical field some interesting questions remain: Can extended Kalman filtering improve state estimation from noisy IMU data? Could model predictive control leverage this learned dynamics model for predictive stabilization? How robust are these controllers to wind disturbances and model uncertainties?
+Beyond flight testing, in the theoretical field some interesting questions remain: Can extended Kalman filtering improve state estimation from noisy IMU data? Could model predictive control leverage this learned dynamics model for predictive stabilization? How robust are these controllers to wind disturbances and model uncertainties?
 
 These questions sit at the intersection of control theory, machine learning, and aerospace engineering—exactly where the interesting problems live.
 
