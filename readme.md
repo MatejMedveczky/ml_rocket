@@ -51,6 +51,8 @@ The network weights export to JSON format for deployment on ESP32-based flight c
 
 The natural next step is hardware validation on actual flight tests. The CAD model shows the mechanical design for the gimbal mount system—translating these trained control policies from simulation to physical hardware remains the critical validation step.
 
+[Rocket CAD Model](rocket_body_v35.png)
+
 Beyond flight testing, interesting questions remain: Can extended Kalman filtering improve state estimation from noisy IMU data? Could model predictive control leverage this learned dynamics model for predictive stabilization? How robust are these controllers to wind disturbances and model uncertainties?
 
 These questions sit at the intersection of control theory, machine learning, and aerospace engineering—exactly where the interesting problems live.
